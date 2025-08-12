@@ -1,0 +1,215 @@
+import csv
+import xml.etree.ElementTree as ET
+from datetime import datetime
+import html
+import re
+from pathlib import Path
+import unicodedata
+
+# ---------- CONFIG ----------
+INPUT_CSV = "ado_work_items.csv"
+OUTPUT_XML = "schedule_project.xml"
+SUSPECT_LOG = "suspects.txt"
+
+MAX_TASKS = None         # e.g., 50 to test first 50; None = all
+ONLY_UID = None          # e.g., 563 to export only that task (1-based)
+ASCII_ONLY_NAMES = True  # force names to pure ASCII to avoid MSP import quirks
+NAME_MAXLEN = 255        # typical safe max for task names
+# ---------------------------
+
+def format_date(date_str):
+    """
+    Convert date string to MS Project format (MSPDI uses ISO8601).
+    Accepts YYYY-MM-DD or MM/DD/YYYY. Returns None if invalid/blank.
+    """
+    if not date_str or str(date_str).strip() == "":
+        return None
+    s = str(date_str).strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            # Use 08:00 start-of-day to avoid midnight timezone quirks
+            return dt.strftime("%Y-%m-%dT08:00:00")
+        except ValueError:
+            continue
+    print(f"Skipping bad date '{date_str}': unrecognized format")
+    return None
+
+def strip_controls(s: str) -> str:
+    # remove ASCII control chars except tab/newline if present
+    return re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', s)
+
+def force_ascii(s: str) -> str:
+    # Normalize and drop any non-ASCII characters
+    s = unicodedata.normalize("NFKD", s)
+    return s.encode("ascii", "ignore").decode("ascii")
+
+def clean_title(raw, fallback, suspects):
+    """
+    Remove control chars, optionally force ASCII, escape for XML, truncate, and ensure non-empty.
+    Also logs potential issues for later review.
+    """
+    before = (raw or "").strip()
+    txt = strip_controls(before)
+
+    changed = []
+    if txt != before:
+        changed.append("control-chars-removed")
+
+    if ASCII_ONLY_NAMES:
+        ascii_txt = force_ascii(txt)
+        if ascii_txt != txt:
+            changed.append("non-ascii-removed")
+        txt = ascii_txt
+
+    # Escape XML specials
+    escaped = html.escape(txt)
+    if escaped != txt:
+        changed.append("xml-escaped")
+    txt = escaped
+
+    # Truncate if needed
+    if len(txt) > NAME_MAXLEN:
+        txt = txt[:NAME_MAXLEN]
+        changed.append("name-truncated")
+
+    # Fallback if empty
+    if not txt:
+        txt = fallback
+        changed.append("fallback-name")
+
+    if changed:
+        suspects.append(
+            f"Name suspect → {','.join(changed)} | original={repr(before)} | cleaned={repr(txt)}"
+        )
+
+    return txt
+
+# MSPDI namespace
+NS = "http://schemas.microsoft.com/project"
+ET.register_namespace("", NS)
+
+def el(parent, tag, text=None):
+    e = ET.SubElement(parent, f"{{{NS}}}{tag}")
+    if text is not None:
+        e.text = str(text)
+    return e
+
+def build_project_root():
+    project = ET.Element(f"{{{NS}}}Project")
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    el(project, "Name", "Imported Schedule")
+    el(project, "CreationDate", now)
+    el(project, "LastSaved", now)
+    el(project, "ScheduleFromStart", 1)
+    el(project, "CalendarUID", 1)
+    # Reasonable defaults
+    el(project, "MinutesPerDay", 480)
+    el(project, "MinutesPerWeek", 2400)
+    el(project, "DaysPerMonth", 20)
+    el(project, "DefaultStartTime", "08:00:00")
+    el(project, "DefaultFinishTime", "17:00:00")
+    el(project, "WeekStartDay", 1)  # 1 = Sunday in MSPDI
+    return project
+
+def add_standard_calendar(project):
+    calendars = el(project, "Calendars")
+    cal = el(calendars, "Calendar")
+    el(cal, "UID", 1)
+    el(cal, "Name", "Standard")
+    el(cal, "IsBaseCalendar", 1)
+    el(cal, "BaseCalendarUID", -1)
+    # Not defining working times here; Project will assume defaults.
+
+def add_root_summary_task(tasks):
+    """
+    MS Project behaves better when a root summary task (UID 0) exists.
+    """
+    t = el(tasks, "Task")
+    el(t, "UID", 0)
+    el(t, "ID", 0)
+    el(t, "Type", 1)
+    el(t, "IsNull", 0)
+    el(t, "Name", "Project Summary")
+    el(t, "CreateDate", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
+    el(t, "OutlineLevel", 1)
+    el(t, "Summary", 1)
+    el(t, "Active", 1)
+    el(t, "Manual", 0)
+
+def read_csv_rows(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        # Strip header whitespace to avoid key surprises
+        reader.fieldnames = [h.strip() for h in (reader.fieldnames or [])]
+        print("Columns found:", reader.fieldnames)
+        for row in reader:
+            # Normalize keys: strip whitespace on each key in the row
+            yield { (k.strip() if k else k): v for k, v in row.items() }
+
+def main():
+    if not Path(INPUT_CSV).exists():
+        raise SystemExit(f"Missing input CSV: {INPUT_CSV}")
+
+    suspects = []
+    project = build_project_root()
+    tasks = el(project, "Tasks")
+    add_root_summary_task(tasks)
+
+    written = 0
+    next_uid = 1
+
+    for row in read_csv_rows(INPUT_CSV):
+        # Optional narrowing for a single UID, for debugging
+        if ONLY_UID is not None and next_uid != ONLY_UID:
+            next_uid += 1
+            continue
+
+        # Title from typical columns; adjust if your CSV differs
+        raw_title = row.get("Title") or row.get("Task Name") or row.get("Name") or ""
+        task_name = clean_title(raw_title, f"Task {next_uid}", suspects)
+
+        # Dates: look for common column names
+        start_raw  = row.get("Created Date") or row.get("StartDate") or row.get("Start")
+        finish_raw = row.get("FinishDate") or row.get("Finish")
+
+        start = format_date(start_raw)
+        finish = format_date(finish_raw)
+
+        t = el(tasks, "Task")
+        el(t, "UID", next_uid)
+        el(t, "ID", next_uid)
+        el(t, "Type", 1)
+        el(t, "IsNull", 0)
+        el(t, "WBS", str(next_uid))           # simple WBS
+        el(t, "OutlineLevel", 2)              # children under the root summary
+        el(t, "Active", 1)
+        el(t, "Manual", 0)
+        el(t, "Name", task_name)
+        el(t, "CreateDate", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
+
+        if start:
+            el(t, "Start", start)
+        if finish:
+            el(t, "Finish", finish)
+
+        written += 1
+        if MAX_TASKS is not None and written >= MAX_TASKS:
+            break
+
+        next_uid += 1
+
+    add_standard_calendar(project)
+
+    tree = ET.ElementTree(project)
+    tree.write(OUTPUT_XML, encoding="utf-8", xml_declaration=True)
+    print(f"Wrote {OUTPUT_XML} with {written} tasks.")
+
+    if suspects:
+        Path(SUSPECT_LOG).write_text("\n".join(suspects), encoding="utf-8")
+        print(f"Wrote suspect name log: {SUSPECT_LOG}")
+    else:
+        print("No suspect names detected.")
+
+if __name__ == "__main__":
+    main()
